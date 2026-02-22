@@ -392,66 +392,155 @@ print("Actual Over2.5 rate:", float(((df_all["goals_home"] + df_all["goals_away"
 # ----------------- APPLY CALIBRATION (Over2.5 only) -----------------
 if len(cal_preds) < 30:
     print("\n⚠️ Too few CAL samples; falling back to RAW Over2.5.")
-    p_over_cal = p_over_raw
+    p_over25_cal = p_over_raw
     dbg = {"range": None, "n": 0, "pred_mean": None, "act_mean": None, "ratio": 1.0}
 else:
-    p_over_cal, dbg = calibrate_over25_adaptive(
+    p_over25_cal, dbg = calibrate_over25_adaptive(
         p_over_raw, cal_preds, cal_actuals, BINS, MIN_BUCKET_N, prior_strength=8.0
     )
 
-p_under_cal = 1.0 - p_over_cal
-
-print("\nTotals (RAW vs CAL):")
-print("RAW Over 2.5:", pct(p_over_raw), "fair:", round(fair_odds(p_over_raw), 2))
-print("CAL Over 2.5:", pct(p_over_cal), "fair:", round(fair_odds(p_over_cal), 2))
-print("RAW Under 2.5:", pct(p_under_raw), "fair:", round(fair_odds(p_under_raw), 2))
-print("CAL Under 2.5:", pct(p_under_cal), "fair:", round(fair_odds(p_under_cal), 2))
-
 if dbg["range"] is not None:
     lo, hi = dbg["range"]
-    print("\nCalibration used (after merging if needed):")
+    print("\nCalibration used (Over2.5, after merging if needed):")
     print(f"range {lo:.2f}-{hi:.2f} | n={dbg['n']} | pred_mean={dbg['pred_mean']:.3f} | act_mean={dbg['act_mean']:.3f} | ratio={dbg['ratio']:.3f}")
 else:
     print("\nCalibration used: fallback (no bucket info).")
 
-# ----------------- TIMING CONSISTENT WITH CALIBRATED TOTAL INTENSITY -----------------
-scale_s = find_lambda_scale_to_match_over25(p_over_cal, exp_home_goals, exp_away_goals)
+# ----------------- DERIVED MATRIX FROM CALIBRATED TOTAL INTENSITY -----------------
+def poisson_pmf_vector(lmbda, max_goals=12):
+    idx = np.arange(max_goals + 1)
+    fact = np.array([math.factorial(i) for i in idx], dtype=float)
+    pmf = np.exp(-lmbda) * (lmbda ** idx) / fact
+    tail = max(0.0, 1.0 - float(pmf.sum()))
+    pmf[-1] += tail
+    return pmf
+
+def independent_goal_matrix(lambda_home, lambda_away, max_goals=12):
+    ph = poisson_pmf_vector(lambda_home, max_goals)
+    pa = poisson_pmf_vector(lambda_away, max_goals)
+    return np.outer(ph, pa)
+
+def p_over_line_from_matrix(m, line):
+    H, A = m.shape
+    hg = np.arange(H)[:, None]
+    ag = np.arange(A)[None, :]
+    thresh = int(math.floor(line)) + 1
+    return float(m[(hg + ag) >= thresh].sum())
+
+def p_btts_from_matrix(m):
+    H, A = m.shape
+    hg = np.arange(H)[:, None]
+    ag = np.arange(A)[None, :]
+    return float(m[(hg >= 1) & (ag >= 1)].sum())
+
+def top_scorelines(m, k=5):
+    flat = [((i, j), float(m[i, j])) for i in range(m.shape[0]) for j in range(m.shape[1])]
+    return sorted(flat, key=lambda x: x[1], reverse=True)[:k]
+
+def first_goal_range_by_minute(total_lambda, t_min, low_mult=0.85, high_mult=1.15):
+    frac = t_min / 90.0
+    p_mid = 1.0 - math.exp(-total_lambda * frac)
+    p_low = 1.0 - math.exp(-(total_lambda * low_mult) * frac)
+    p_high = 1.0 - math.exp(-(total_lambda * high_mult) * frac)
+    return min(p_low, p_high), p_mid, max(p_low, p_high)
+
+scale_s = find_lambda_scale_to_match_over25(p_over25_cal, exp_home_goals, exp_away_goals)
 lambda_home_adj = exp_home_goals * scale_s
 lambda_away_adj = exp_away_goals * scale_s
 L_adj = lambda_home_adj + lambda_away_adj
 
-print("\nLambda scaling to match CAL Over2.5:")
-print("scale s:", round(scale_s, 3))
-print("Adj home lambda:", round(lambda_home_adj, 2))
-print("Adj away lambda:", round(lambda_away_adj, 2))
-print("Adj total lambda:", round(L_adj, 2))
-print("Check Poisson Over2.5 from adj total:", pct(poisson_over25_from_total_lambda(L_adj)))
+m_cal = independent_goal_matrix(lambda_home_adj, lambda_away_adj, max_goals=12)
+Hc, Ac = m_cal.shape
+hgc = np.arange(Hc)[:, None]
+agc = np.arange(Ac)[None, :]
 
-p_no_goals = math.exp(-L_adj)
-p_home_first = (lambda_home_adj / L_adj) * (1 - p_no_goals) if L_adj > 0 else 0.0
-p_away_first = (lambda_away_adj / L_adj) * (1 - p_no_goals) if L_adj > 0 else 0.0
+p_home_win_cal = float(m_cal[hgc > agc].sum())
+p_draw_cal = float(m_cal[hgc == agc].sum())
+p_away_win_cal = float(m_cal[hgc < agc].sum())
 
-print("\nFirst goal (Poisson timing, using CALIBRATED total intensity):")
-print("Home scores first:", pct(p_home_first))
-print("Away scores first:", pct(p_away_first))
-print("No goals (0-0):    ", pct(p_no_goals))
+# Totals / specials from calibrated matrix
+p_over15_cal = p_over_line_from_matrix(m_cal, 1.5)
+p_over25_cal = p_over_line_from_matrix(m_cal, 2.5)
+p_over35_cal = p_over_line_from_matrix(m_cal, 3.5)
+p_under15_cal = 1.0 - p_over15_cal
+p_under25_cal = 1.0 - p_over25_cal
+p_under35_cal = 1.0 - p_over35_cal
 
-def p_first_goal_by_minute(t_min):
-    return 1 - math.exp(-L_adj * (t_min / 90.0))
+p_btts_yes_cal = p_btts_from_matrix(m_cal)
+p_btts_no_cal = 1.0 - p_btts_yes_cal
 
-for t in [10, 20, 30, 45, 60, 75]:
-    print(f"First goal by {t:>2}':", pct(p_first_goal_by_minute(t)))
+# win + over combos (from calibrated matrix)
+p_home_win_over15 = float(m_cal[(hgc > agc) & ((hgc + agc) >= 2)].sum())
+p_home_win_over25 = float(m_cal[(hgc > agc) & ((hgc + agc) >= 3)].sum())
+p_away_win_over15 = float(m_cal[(hgc < agc) & ((hgc + agc) >= 2)].sum())
+p_away_win_over25 = float(m_cal[(hgc < agc) & ((hgc + agc) >= 3)].sum())
 
-# ----------------- MATCH SUMMARY (RAW scoreline model) -----------------
-print(f"\nMatch (RAW model): {HOME} vs {AWAY}")
+# halftime approximations (heuristic): assume 46% of full-time expected goals happen by HT
+HT_SHARE = 0.46
+m_ht = independent_goal_matrix(lambda_home_adj * HT_SHARE, lambda_away_adj * HT_SHARE, max_goals=8)
+Hh, Ah = m_ht.shape
+hgh = np.arange(Hh)[:, None]
+agh = np.arange(Ah)[None, :]
+
+p_ht_home = float(m_ht[hgh > agh].sum())
+p_ht_draw = float(m_ht[hgh == agh].sum())
+p_ht_away = float(m_ht[hgh < agh].sum())
+
+print("\n================ MODEL ORIGIN CHECK ================")
+print("Penaltyblog-native (direct from Dixon-Coles goal matrix):")
+print("- Full-time 1X2, scoreline distribution (RAW)")
+print("Code-derived assumptions:")
+print("- Calibration mapping for Over2.5 using historical bucket ratios")
+print("- Calibrated matrix via independent Poisson with rescaled lambdas")
+print("- First-goal timing and halftime split (time-process assumptions)")
+
+print("\n================ MAIN OUTPUT (CONSISTENT BOARD) ================")
+print(f"Match: {HOME} vs {AWAY}")
+print("Using calibrated matrix for totals/specials to avoid RAW/CAL mixing.")
+
+print("\n1X2 (RAW penaltyblog model):")
 print("Home win:", pct(p_home_win), "fair:", round(fair_odds(p_home_win), 2))
-print("Draw    :", pct(p_draw),     "fair:", round(fair_odds(p_draw), 2))
+print("Draw    :", pct(p_draw), "fair:", round(fair_odds(p_draw), 2))
 print("Away win:", pct(p_away_win), "fair:", round(fair_odds(p_away_win), 2))
 
-print("\nCommon AH (matrix-based, RAW model):")
-print("Home -0.5 (must win):", pct(p_home_win), "fair:", round(fair_odds(p_home_win), 2))
-print("Away +0.5 (win or draw):", pct(p_away_win + p_draw), "fair:", round(fair_odds(p_away_win + p_draw), 2))
+print("\nTotals (CALIBRATED board):")
+print("Over 1.5:", pct(p_over15_cal), "fair:", round(fair_odds(p_over15_cal), 2))
+print("Over 2.5:", pct(p_over25_cal), "fair:", round(fair_odds(p_over25_cal), 2))
+print("Over 3.5:", pct(p_over35_cal), "fair:", round(fair_odds(p_over35_cal), 2))
+print("Under 1.5:", pct(p_under15_cal), "fair:", round(fair_odds(p_under15_cal), 2))
+print("Under 2.5:", pct(p_under25_cal), "fair:", round(fair_odds(p_under25_cal), 2))
+print("Under 3.5:", pct(p_under35_cal), "fair:", round(fair_odds(p_under35_cal), 2))
 
-print("\nLibrary helper (may use different convention):")
+print("\nBTTS (CALIBRATED board):")
+print("BTTS Yes:", pct(p_btts_yes_cal), "fair:", round(fair_odds(p_btts_yes_cal), 2))
+print("BTTS No :", pct(p_btts_no_cal), "fair:", round(fair_odds(p_btts_no_cal), 2))
+
+print("\nWin + Totals combos (CALIBRATED board):")
+print("Home win & Over 1.5:", pct(p_home_win_over15), "fair:", round(fair_odds(p_home_win_over15), 2))
+print("Home win & Over 2.5:", pct(p_home_win_over25), "fair:", round(fair_odds(p_home_win_over25), 2))
+print("Away win & Over 1.5:", pct(p_away_win_over15), "fair:", round(fair_odds(p_away_win_over15), 2))
+print("Away win & Over 2.5:", pct(p_away_win_over25), "fair:", round(fair_odds(p_away_win_over25), 2))
+
+print("\nFirst goal timing (LESS CONFIDENT: range from ±15% intensity sensitivity):")
+p_no_goals_cal = float(m_cal[0, 0])
+print("No goals (0-0):", pct(p_no_goals_cal))
+for t in [10, 20, 30, 45, 60, 75]:
+    lo, mid, hi = first_goal_range_by_minute(L_adj, t, low_mult=0.85, high_mult=1.15)
+    print(f"By {t:>2}' -> {pct(mid)}  (range {pct(lo)} to {pct(hi)})")
+
+print("\nHalftime (HEURISTIC split, 46% goal intensity by HT):")
+print("HT Home lead:", pct(p_ht_home), "fair:", round(fair_odds(p_ht_home), 2))
+print("HT Draw     :", pct(p_ht_draw), "fair:", round(fair_odds(p_ht_draw), 2))
+print("HT Away lead:", pct(p_ht_away), "fair:", round(fair_odds(p_ht_away), 2))
+
+print("\nTop 5 halftime scorelines (heuristic):")
+for (h, a), p in top_scorelines(m_ht, k=5):
+    print(f"HT {h}-{a}: {pct(p)}")
+
+print("\nTop 8 full-time scorelines (RAW penaltyblog matrix):")
+for (h, a), p in top_scorelines(m, k=8):
+    print(f"FT {h}-{a}: {pct(p)}")
+
+print("\nLibrary helper (reference only, may use different convention):")
 print("asian_handicap('home', -0.5) =", probs.asian_handicap('home', -0.5))
 print("asian_handicap('away', +0.5) =", probs.asian_handicap('away', +0.5))
